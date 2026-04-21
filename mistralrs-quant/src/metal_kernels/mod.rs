@@ -3319,3 +3319,89 @@ pub fn call_fp8_vector_dequant(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// Fused TurboQuant (PolarQuant + QJL) encode + decode in-place.
+///
+/// One threadgroup per vector; each threadgroup uses `head_dim` threads to
+/// rotate the input, polar-quantize, reconstruct, project the residual,
+/// add the QJL correction, inverse-rotate, and write back. The output dtype
+/// matches the input dtype — same shape as input — and stores the lossy
+/// reconstruction (the codec mirrors the pure-Rust reference in
+/// `vibe-infer/src/kv_cache_tq.rs`).
+///
+/// Buffer contract (all device buffers, contiguous, no stride support):
+/// - `input`:      [num_vectors * head_dim], dtype = `ty`
+/// - `rotation`:   [head_dim * head_dim], fp32, row-major (R)
+/// - `projection`: [proj_dim * head_dim], fp32, row-major (P)
+/// - `output`:     [num_vectors * head_dim], dtype = `ty`
+///
+/// Thread layout:
+/// - grid = (num_vectors, 1, 1)
+/// - group = (head_dim, 1, 1)
+///
+/// Threadgroup memory: 4 * head_dim floats for y / rec / res / final, plus
+/// reduction scratch sized for `ceil(head_dim / 32)` floats. We round up to
+/// 32 floats (one simdgroup) so the helper always has room.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub fn call_turboquant_encode(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    input: &Buffer,
+    rotation: &Buffer,
+    projection: &Buffer,
+    output: &Buffer,
+    num_vectors: usize,
+    head_dim: usize,
+    proj_dim: usize,
+) -> Result<(), MetalKernelError> {
+    let name = match ty {
+        DType::F32 => "turboquant_encode_float",
+        DType::F16 => "turboquant_encode_half",
+        other => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F32, DType::F16],
+                got: other,
+            })
+        }
+    };
+    let pipeline = kernels.load_pipeline(device, name)?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            input,
+            rotation,
+            projection,
+            output,
+            num_vectors as u32,
+            head_dim as u32,
+            proj_dim as u32
+        )
+    );
+
+    // Shared memory: 4 * head_dim floats (y, rec, res, final) +
+    // 32 floats reduction scratch (one simdgroup wide; the helper only
+    // needs ceil(head_dim/32) entries but 32 floats is a tiny over-allocation).
+    let shared_mem_size = (4 * head_dim + 32) * std::mem::size_of::<f32>();
+    encoder.set_threadgroup_memory_length(0, shared_mem_size);
+
+    let grid_dims = MTLSize {
+        width: num_vectors,
+        height: 1,
+        depth: 1,
+    };
+    let group_dims = MTLSize {
+        width: head_dim,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(grid_dims, group_dims);
+    Ok(())
+}
