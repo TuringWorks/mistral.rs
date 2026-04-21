@@ -18,6 +18,9 @@
 //! right backend by inspecting `input.device()`. Returns `Err` for CPU
 //! tensors (callers should use `CandleTurboQuantCodec` for the host path).
 
+#[cfg(feature = "cuda")]
+pub mod ffi;
+
 mod ops;
 
 pub use ops::encode;

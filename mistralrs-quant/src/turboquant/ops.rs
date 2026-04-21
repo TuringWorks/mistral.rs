@@ -34,6 +34,126 @@ impl<'a> CustomOp1 for TurboQuantEncode<'a> {
         );
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        input_s: &candle_core::CudaStorage,
+        input_l: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::Storage;
+        use half::f16;
+
+        use crate::utils::slice_ptr;
+
+        if !super::ffi::HAVE_TURBOQUANT_KERNELS {
+            candle_core::bail!("Do not have TurboQuant CUDA kernels.");
+        }
+        if input_l.start_offset() != 0 || !input_l.is_contiguous() {
+            candle_core::bail!("TurboQuantEncode: input must have start_offset 0 and be contiguous");
+        }
+
+        let dtype = input_s.dtype();
+        let dev = input_s.device();
+        let total = input_l.shape().elem_count();
+        if total % self.head_dim != 0 {
+            candle_core::bail!(
+                "TurboQuantEncode: input element count {} not a multiple of head_dim {}",
+                total,
+                self.head_dim
+            );
+        }
+        let num_vectors = total / self.head_dim;
+
+        let (rot_storage, _) = self.rotation.storage_and_layout();
+        let Storage::Cuda(rot_cuda) = &*rot_storage else {
+            candle_core::bail!("TurboQuantEncode: rotation must live on CUDA");
+        };
+        let (proj_storage, _) = self.projection.storage_and_layout();
+        let Storage::Cuda(proj_cuda) = &*proj_storage else {
+            candle_core::bail!("TurboQuantEncode: projection must live on CUDA");
+        };
+        let rot_slice = match &rot_cuda.slice {
+            CudaStorageSlice::F32(s) => s,
+            _ => candle_core::bail!("TurboQuantEncode: rotation must be F32"),
+        };
+        let proj_slice = match &proj_cuda.slice {
+            CudaStorageSlice::F32(s) => s,
+            _ => candle_core::bail!("TurboQuantEncode: projection must be F32"),
+        };
+        let (rotation_ptr, _rotation_guard) = slice_ptr(rot_slice, 0);
+        let (projection_ptr, _projection_guard) = slice_ptr(proj_slice, 0);
+
+        let stream = dev.cuda_stream().cu_stream();
+        let num_vectors_u32: u32 = num_vectors
+            .try_into()
+            .map_err(|_| candle_core::Error::Msg("num_vectors exceeds u32::MAX".into()))?;
+        let head_dim_u32: u32 = self
+            .head_dim
+            .try_into()
+            .map_err(|_| candle_core::Error::Msg("head_dim exceeds u32::MAX".into()))?;
+        let proj_dim_u32: u32 = self
+            .proj_dim
+            .try_into()
+            .map_err(|_| candle_core::Error::Msg("proj_dim exceeds u32::MAX".into()))?;
+
+        let out_storage = match dtype {
+            DType::F32 => {
+                let input_slice = match &input_s.slice {
+                    CudaStorageSlice::F32(s) => s,
+                    _ => candle_core::bail!("input slice dtype mismatch (expected F32)"),
+                };
+                let output = dev.alloc_zeros::<f32>(total)?;
+                let (input_ptr, _input_guard) = slice_ptr(input_slice, 0);
+                let (output_ptr, output_guard) = slice_ptr(&output, 0);
+                unsafe {
+                    super::ffi::launch_turboquant_encode_f32(
+                        input_ptr as *const f32,
+                        rotation_ptr as *const f32,
+                        projection_ptr as *const f32,
+                        output_ptr as *mut f32,
+                        num_vectors_u32,
+                        head_dim_u32,
+                        proj_dim_u32,
+                        stream,
+                    );
+                }
+                drop(output_guard);
+                candle_core::CudaStorage::wrap_cuda_slice(output, dev.clone())
+            }
+            DType::F16 => {
+                let input_slice = match &input_s.slice {
+                    CudaStorageSlice::F16(s) => s,
+                    _ => candle_core::bail!("input slice dtype mismatch (expected F16)"),
+                };
+                let output = dev.alloc_zeros::<f16>(total)?;
+                let (input_ptr, _input_guard) = slice_ptr(input_slice, 0);
+                let (output_ptr, output_guard) = slice_ptr(&output, 0);
+                unsafe {
+                    super::ffi::launch_turboquant_encode_f16(
+                        input_ptr as *const f16,
+                        rotation_ptr as *const f32,
+                        projection_ptr as *const f32,
+                        output_ptr as *mut f16,
+                        num_vectors_u32,
+                        head_dim_u32,
+                        proj_dim_u32,
+                        stream,
+                    );
+                }
+                drop(output_guard);
+                candle_core::CudaStorage::wrap_cuda_slice(output, dev.clone())
+            }
+            other => candle_core::bail!(
+                "TurboQuantEncode CUDA: unsupported dtype {:?} (only F32/F16)",
+                other
+            ),
+        };
+
+        Ok((out_storage, input_l.shape().clone()))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
