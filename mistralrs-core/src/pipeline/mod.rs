@@ -316,7 +316,8 @@ pub(crate) fn validate_lora_loader_config(
 }
 
 pub use crate::kv_cache::{
-    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache, NormalCacheType,
+    Cache, CacheManager, EitherCache, HybridLayerCache, KvCache, KvCacheCodec, KvCacheCodecRef,
+    LayerCaches, NormalCache, NormalCacheType, PassthroughCodec, RotatingCache, SingleCache,
 };
 
 pub(crate) const RECURRENT_GRAPH_PAD_SLOTS: usize = 1;

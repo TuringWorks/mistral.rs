@@ -9,11 +9,13 @@ use crate::{
     sequence::Sequence,
 };
 
+mod codec;
 mod full_cache;
 mod hybrid_cache;
 mod rotating_cache;
 mod single_cache;
 
+pub use codec::{KvCacheCodec, KvCacheCodecRef, PassthroughCodec};
 pub use full_cache::{EitherCache, LayerCaches};
 #[cfg(feature = "cuda")]
 pub(crate) use hybrid_cache::RecurrentCheckpointStateSnapshot;
@@ -107,6 +109,25 @@ impl KvCache {
 
     pub fn new_shared(owner: usize) -> Self {
         Self::Shared { owner }
+    }
+
+    /// Install an encode/decode codec on both K and V caches. Returns `true`
+    /// if the codec was installed (Normal/Rotating); `false` for `Shared`,
+    /// which doesn't own a cache and is a no-op.
+    pub fn set_codec(&mut self, codec: Arc<dyn codec::KvCacheCodec>) -> bool {
+        match self {
+            Self::Normal { k, v } => {
+                k.set_codec(codec.clone());
+                v.set_codec(codec);
+                true
+            }
+            Self::Rotating { k, v } => {
+                k.set_codec(codec.clone());
+                v.set_codec(codec);
+                true
+            }
+            Self::Shared { .. } => false,
+        }
     }
 
     pub fn k(&self) -> Result<Option<Tensor>> {
@@ -572,7 +593,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 continue;
             };
             match cache_ref {
-                KvCache::Normal { k: old_k, .. } => {
+                KvCache::Normal { k: old_k, v: old_v } => {
                     let template_cache_dim = old_k.dim;
                     let template_cache_csl = old_k.current_seq_len;
                     let template_cache_msl = old_k.max_seq_len;
@@ -585,6 +606,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: template_cache_capsl,
+                            codec: old_k.codec.clone(),
                         },
                         v: SingleCache {
                             all_data: v_cache.map(|x| x.contiguous().unwrap()),
@@ -592,10 +614,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: template_cache_capsl,
+                            codec: old_v.codec.clone(),
                         },
                     });
                 }
-                KvCache::Rotating { k: old_k, .. } => {
+                KvCache::Rotating { k: old_k, v: old_v } => {
                     let template_cache_dim = old_k.dim;
                     let template_cache_csl = old_k.current_seq_len;
                     let template_cache_msl = old_k.max_seq_len;
@@ -611,6 +634,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             capacity_seq_len: template_cache_capsl,
                             write_pos: template_cache_wpos,
                             last_append_result: None,
+                            codec: old_k.codec.clone(),
                         },
                         v: RotatingCache {
                             all_data: v_cache.map(|x| x.contiguous().unwrap()),
@@ -620,6 +644,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             capacity_seq_len: template_cache_capsl,
                             write_pos: template_cache_wpos,
                             last_append_result: None,
+                            codec: old_v.codec.clone(),
                         },
                     });
                 }
@@ -688,6 +713,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 current_seq_len: cache_k.current_seq_len,
                                 max_seq_len: cache_k.max_seq_len,
                                 capacity_seq_len: cache_k.capacity_seq_len,
+                                codec: cache_k.codec.clone(),
                             },
                             v: SingleCache {
                                 all_data: Some(v),
@@ -695,6 +721,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 current_seq_len: cache_v.current_seq_len,
                                 max_seq_len: cache_v.max_seq_len,
                                 capacity_seq_len: cache_v.capacity_seq_len,
+                                codec: cache_v.codec.clone(),
                             },
                         });
                     }
@@ -711,6 +738,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 capacity_seq_len: cache_k.capacity_seq_len,
                                 write_pos: cache_k.write_pos,
                                 last_append_result: None,
+                                codec: cache_k.codec.clone(),
                             },
                             v: RotatingCache {
                                 all_data: Some(v),
@@ -720,6 +748,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 capacity_seq_len: cache_v.capacity_seq_len,
                                 write_pos: cache_v.write_pos,
                                 last_append_result: None,
+                                codec: cache_v.codec.clone(),
                             },
                         });
                     }
@@ -764,7 +793,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             }
 
             match &old_caches[layer_idx] {
-                KvCache::Rotating { k, .. } => {
+                KvCache::Rotating { k, v } => {
                     *layer = KvCache::Rotating {
                         k: RotatingCache {
                             all_data: None,
@@ -774,6 +803,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             capacity_seq_len: k.capacity_seq_len,
                             write_pos: 0,
                             last_append_result: None,
+                            codec: k.codec.clone(),
                         },
                         v: RotatingCache {
                             all_data: None,
@@ -783,6 +813,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             capacity_seq_len: k.capacity_seq_len,
                             write_pos: 0,
                             last_append_result: None,
+                            codec: v.codec.clone(),
                         },
                     };
                     continue;
@@ -836,7 +867,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
 
             // Use this for the various parameters. Assumes all seqs are from one model.
             match &old_caches[layer_idx] {
-                KvCache::Normal { k, .. } => {
+                KvCache::Normal { k, v } => {
                     let template_cache_dim = k.dim;
                     let template_cache_msl = k.max_seq_len;
 
@@ -847,6 +878,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: 0,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: k_cache.dims()[template_cache_dim],
+                            codec: k.codec.clone(),
                         },
                         v: SingleCache {
                             all_data: Some(v_cache.zeros_like().unwrap()),
@@ -854,6 +886,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: 0,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: k_cache.dims()[template_cache_dim],
+                            codec: v.codec.clone(),
                         },
                     };
                     *layer = cache;
