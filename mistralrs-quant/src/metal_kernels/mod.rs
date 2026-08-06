@@ -4958,13 +4958,17 @@ pub fn call_turboquant_encode(
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
+    // `output` is the kernel's only non-const `device T*`, so it must go
+    // through `Output::new` — a bare `&Buffer` binds via `set_buffer` (an
+    // input) and the write stays invisible to hazard tracking, which lets the
+    // read-back observe unsynchronized data rather than the kernel's result.
     set_params!(
         encoder,
         (
             input,
             rotation,
             projection,
-            output,
+            Output::new(output),
             num_vectors as u32,
             head_dim as u32,
             proj_dim as u32
