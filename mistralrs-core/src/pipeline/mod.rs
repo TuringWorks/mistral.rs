@@ -261,8 +261,8 @@ pub(crate) fn validate_lora_loader_config(
 }
 
 pub use crate::kv_cache::{
-    Cache, CacheManager, EitherCache, HybridLayerCache, KvCache, LayerCaches, NormalCache,
-    NormalCacheType,
+    Cache, CacheManager, EitherCache, HybridLayerCache, KvCache, KvCacheCodec, KvCacheCodecRef,
+    LayerCaches, NormalCache, NormalCacheType, PassthroughCodec, RotatingCache, SingleCache,
 };
 
 pub(crate) type DeviceTensorMap = HashMap<DeviceLocation, Tensor>;

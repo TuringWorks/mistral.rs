@@ -44,6 +44,7 @@ mod pertensor_fp8;
 pub mod rotary;
 pub mod safetensors;
 mod scalar_fp8;
+pub mod turboquant;
 mod unquantized;
 mod uqff;
 mod utils;

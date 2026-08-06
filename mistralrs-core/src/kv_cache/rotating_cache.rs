@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use candle_core::{Result, Tensor};
 
+use super::codec::{KvCacheCodec, KvCacheCodecRef};
 use super::NormalCache;
 
 #[derive(Debug, Clone)]
@@ -8,7 +11,11 @@ pub struct RotatingCacheSnapshot {
     pub current_seq_len: usize,
     pub max_seq_len: usize,
     pub capacity_seq_len: usize,
+    /// Retained window in *plain* (decoded) form — `snapshot()` goes through
+    /// `current_data()`, which decodes. `restore_from_snapshot` re-encodes on
+    /// the way back in, so the codec must travel with the snapshot.
     pub retained: Option<Tensor>,
+    pub codec: KvCacheCodecRef,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +34,14 @@ pub struct RotatingCache {
     // During prefill this may be larger than the internal buffer (retained + new),
     // which is what shared KV layers need for correct attention.
     pub last_append_result: Option<Tensor>,
+    // Optional encode/decode hook. `None` is the bit-exact default; `Some`
+    // installs a quantization codec (e.g. fp8, TurboQuant). See
+    // `super::codec::KvCacheCodec` for the shape/dtype contract.
+    //
+    // Invariant: `all_data` always holds *encoded* values. Plain tensors are
+    // encoded on the way in; buffer slices are decoded on the way out.
+    // Buffer-internal relocations move encoded bytes and never touch the codec.
+    pub codec: KvCacheCodecRef,
 }
 
 impl RotatingCache {
@@ -39,6 +54,30 @@ impl RotatingCache {
             capacity_seq_len: capacity_seq_len.min(max_seq_len),
             write_pos: 0,
             last_append_result: None,
+            codec: None,
+        }
+    }
+
+    /// Install a compression codec. Call before the first `append()` — see
+    /// `SingleCache::set_codec` for the rationale.
+    pub fn set_codec(&mut self, codec: Arc<dyn KvCacheCodec>) {
+        self.codec = Some(codec);
+    }
+
+    /// Decode a slice read out of `all_data`. No-op when no codec is installed.
+    fn decode(&self, view: Tensor) -> Result<Tensor> {
+        match &self.codec {
+            Some(codec) => codec.decode(&view),
+            None => Ok(view),
+        }
+    }
+
+    /// Encode a plain tensor on its way into `all_data`. No-op when no codec
+    /// is installed.
+    fn encode(&self, src: &Tensor) -> Result<Tensor> {
+        match &self.codec {
+            Some(codec) => codec.encode(src),
+            None => Ok(src.clone()),
         }
     }
 
@@ -74,7 +113,9 @@ impl RotatingCache {
     pub fn current_data(&self) -> Result<Option<Tensor>> {
         let data = match self.all_data.as_ref() {
             None => None,
-            Some(d) => Some(d.narrow(self.dim, self.window_start(), self.retained_len())?),
+            Some(d) => Some(
+                self.decode(d.narrow(self.dim, self.window_start(), self.retained_len())?)?,
+            ),
         };
         Ok(data)
     }
@@ -90,6 +131,7 @@ impl RotatingCache {
             max_seq_len: self.max_seq_len,
             capacity_seq_len: self.capacity_seq_len,
             retained: self.current_data()?,
+            codec: self.codec.clone(),
         })
     }
 
@@ -172,6 +214,7 @@ impl RotatingCache {
                     capacity_seq_len: snapshot.capacity_seq_len.min(snapshot.max_seq_len),
                     write_pos: 0,
                     last_append_result: None,
+                    codec: snapshot.codec.clone(),
                 });
             }
         };
@@ -190,7 +233,17 @@ impl RotatingCache {
         shape[snapshot.dim] = capacity_seq_len;
         let all_data = Tensor::zeros(shape, retained.dtype(), retained.device())?;
         if keep > 0 {
-            all_data.slice_set(&retained, snapshot.dim, 0)?;
+            // `retained` is plain here: `snapshot.retained` came from
+            // `current_data()` (decoded) and `accepted_append` came from
+            // `last_append_result` (also decoded). Re-encode so the restored
+            // buffer keeps the "all_data is encoded" invariant. For a lossy
+            // codec this is one extra encode of already-quantized values,
+            // which lands on the same reconstruction grid.
+            let to_store = match &snapshot.codec {
+                Some(codec) => codec.encode(&retained)?,
+                None => retained,
+            };
+            all_data.slice_set(&to_store, snapshot.dim, 0)?;
         }
 
         Ok(Self {
@@ -201,6 +254,7 @@ impl RotatingCache {
             capacity_seq_len,
             write_pos: keep,
             last_append_result: None,
+            codec: snapshot.codec.clone(),
         })
     }
 
@@ -265,12 +319,17 @@ impl RotatingCache {
         // we need the full K/V (retained + new) for correct attention: different
         // query positions attend to different windows. Read retained BEFORE the
         // buffer is relocated or overwritten below.
+        //
+        // Codec note: the buffer holds encoded values; `src` is plain. This
+        // tensor is consumed by attention, so decode the retained slice before
+        // concatenating it with plain `src`.
         let prefill_full_kv = if seq_len > 1 && (retained_len + seq_len) > self.max_seq_len {
             let ad = self.all_data.as_ref().unwrap();
             Some(if retained_len > 0 {
-                let retained = ad
-                    .narrow(self.dim, window_start, retained_len)?
-                    .contiguous()?;
+                let retained = self.decode(
+                    ad.narrow(self.dim, window_start, retained_len)?
+                        .contiguous()?,
+                )?;
                 Tensor::cat(&[&retained, &src.contiguous()?], self.dim)?
             } else {
                 src.clone()
@@ -286,9 +345,11 @@ impl RotatingCache {
                 shape[self.dim] = self.capacity_seq_len;
                 self.all_data = Some(Tensor::zeros(shape, src.dtype(), src.device())?);
             }
-            let to_copy = src
-                .narrow(self.dim, seq_len - self.max_seq_len, self.max_seq_len)?
-                .contiguous()?;
+            // `src` is plain — encode before it lands in the buffer.
+            let to_copy = self.encode(
+                &src.narrow(self.dim, seq_len - self.max_seq_len, self.max_seq_len)?
+                    .contiguous()?,
+            )?;
             let ad = self.all_data.as_mut().unwrap();
             ad.slice_set(&to_copy, self.dim, 0)?;
             self.write_pos = self.max_seq_len;
@@ -297,6 +358,10 @@ impl RotatingCache {
                 let keep_len = retained_len.min(self.max_seq_len - seq_len);
                 let keep_start = window_start + retained_len - keep_len;
                 let max_capacity = self.max_capacity();
+                // Everything below relocates the retained window *within* the
+                // buffer (or into a freshly grown one). Those bytes are already
+                // encoded, so the codec is deliberately not applied here —
+                // running it would double-quantize the retained window.
                 if self.capacity_seq_len < max_capacity {
                     let needed = keep_len + seq_len;
                     let n_blocks = needed
@@ -323,8 +388,11 @@ impl RotatingCache {
                 }
                 self.write_pos = keep_len;
             }
+            // Encode before taking the mutable borrow of `all_data`.
+            let to_store = self.encode(&src.contiguous()?)?;
+            let write_pos = self.write_pos;
             let ad = self.all_data.as_mut().unwrap();
-            ad.slice_set(&src.contiguous()?, self.dim, self.write_pos)?;
+            ad.slice_set(&to_store, self.dim, write_pos)?;
             self.write_pos += seq_len;
         }
 
@@ -334,7 +402,8 @@ impl RotatingCache {
             full_kv
         } else {
             let ad = self.all_data.as_ref().unwrap();
-            ad.narrow(self.dim, self.window_start(), self.retained_len())?
+            let view = ad.narrow(self.dim, self.window_start(), self.retained_len())?;
+            self.decode(view)?
         };
 
         self.last_append_result = Some(result.clone());
@@ -344,8 +413,11 @@ impl RotatingCache {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use candle_core::{Device, Tensor};
 
+    use super::super::codec::PassthroughCodec;
     use super::RotatingCache;
 
     fn make_src(values: &[f32]) -> candle_core::Result<Tensor> {
@@ -537,6 +609,82 @@ mod tests {
                 .to_vec1::<f32>()?,
             expected_retained
         );
+        Ok(())
+    }
+
+    /// Installing a PassthroughCodec must not change observed values. Covers
+    /// the prefill path that decodes the retained window and concatenates it
+    /// with plain `src`.
+    #[test]
+    fn passthrough_codec_roundtrip() -> candle_core::Result<()> {
+        let mut cache = RotatingCache::new(2, 4, 4);
+        cache.set_codec(Arc::new(PassthroughCodec));
+
+        let first = cache.append(&make_src(&[0., 1., 2.])?)?;
+        assert_eq!(first.flatten_all()?.to_vec1::<f32>()?, vec![0., 1., 2.]);
+
+        // Prefill that overflows the sliding window — exercises the
+        // decode-retained + concat-with-src code path.
+        let second = cache.append(&make_src(&[3., 4., 5.])?)?;
+        assert_eq!(
+            second.flatten_all()?.to_vec1::<f32>()?,
+            vec![0., 1., 2., 3., 4., 5.]
+        );
+
+        let current = cache.current_data()?.unwrap();
+        assert_eq!(
+            current.flatten_all()?.to_vec1::<f32>()?,
+            vec![2., 3., 4., 5.]
+        );
+
+        Ok(())
+    }
+
+    /// The codec must survive the ring-buffer relocation that happens when
+    /// `write_pos` runs past `capacity_seq_len`, and single-token decode
+    /// appends must still read back in order. This is the path the upstream
+    /// v0.9 rewrite introduced — the old cache never relocated.
+    #[test]
+    fn passthrough_codec_survives_window_relocation() -> candle_core::Result<()> {
+        let mut cache = RotatingCache::new(2, 4, 4);
+        cache.set_codec(Arc::new(PassthroughCodec));
+
+        for i in 0..12 {
+            let _ = cache.append(&make_src(&[i as f32])?)?;
+        }
+
+        assert!(cache.codec.is_some(), "codec dropped during relocation");
+        assert_eq!(cache.current_seq_len(), 12);
+        assert_eq!(
+            cache
+                .current_data()?
+                .unwrap()
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            vec![8., 9., 10., 11.]
+        );
+
+        Ok(())
+    }
+
+    /// snapshot/restore round-trips plain values and carries the codec across,
+    /// so a restored cache keeps compressing subsequent appends.
+    #[test]
+    fn snapshot_restore_preserves_codec() -> candle_core::Result<()> {
+        let mut cache = RotatingCache::new(2, 4, 4);
+        cache.set_codec(Arc::new(PassthroughCodec));
+        let _ = cache.append(&make_src(&[0., 1., 2., 3., 4.])?)?;
+
+        let snapshot = cache.snapshot()?;
+        assert!(snapshot.codec.is_some());
+
+        let _ = cache.append(&make_src(&[5., 6., 7.])?)?;
+        let accepted = cache.accepted_append_from_batched_append(&snapshot, 7, 0, 1)?;
+        let restored = RotatingCache::restore_from_snapshot(&snapshot, accepted, 7)?;
+
+        assert!(restored.codec.is_some(), "codec lost across restore");
+        assert_eq!(restored.current_seq_len(), 7);
+
         Ok(())
     }
 }
