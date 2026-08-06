@@ -45,16 +45,16 @@ constant float POLAR_CENTROIDS[4] = {-0.75f, -0.25f, 0.25f, 0.75f};
 
 // SIMD group size on Apple GPUs (always 32 — verify on target via
 // device.simd_group_size if you ever target an oddball).
-constant uint SIMD_SIZE = 32u;
+constant uint TQ_SIMD_SIZE = 32u;
 
 // Cross-simdgroup reduction helper. Reduces `local` (one float per thread) to
 // a single float visible to all threads via shared memory. `scratch` must
-// have at least `ceil(threads_per_threadgroup / SIMD_SIZE)` floats.
+// have at least `ceil(threads_per_threadgroup / TQ_SIMD_SIZE)` floats.
 inline float threadgroup_reduce_sum(float local_val, threadgroup float *scratch,
                                     uint tid, uint sgitg, uint tiisg,
                                     uint ntg) {
   // Step 1: simdgroup reduce.
-  for (uint offset = SIMD_SIZE / 2; offset > 0; offset /= 2) {
+  for (uint offset = TQ_SIMD_SIZE / 2; offset > 0; offset /= 2) {
     local_val += simd_shuffle_xor(local_val, offset);
   }
   // Step 2: lane 0 of each simdgroup writes to scratch.
@@ -63,10 +63,10 @@ inline float threadgroup_reduce_sum(float local_val, threadgroup float *scratch,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   // Step 3: first simdgroup reduces the scratch.
-  const uint num_simdgroups = (ntg + SIMD_SIZE - 1) / SIMD_SIZE;
-  if (tid < SIMD_SIZE) {
+  const uint num_simdgroups = (ntg + TQ_SIMD_SIZE - 1) / TQ_SIMD_SIZE;
+  if (tid < TQ_SIMD_SIZE) {
     float v = (tid < num_simdgroups) ? scratch[tid] : 0.0f;
-    for (uint offset = SIMD_SIZE / 2; offset > 0; offset /= 2) {
+    for (uint offset = TQ_SIMD_SIZE / 2; offset > 0; offset /= 2) {
       v += simd_shuffle_xor(v, offset);
     }
     if (tid == 0) {
@@ -106,7 +106,7 @@ template <typename T>
   //   [head_dim .. 2*head_dim)    : rec (polar reconstruction)
   //   [2*head_dim .. 3*head_dim)  : residual = y - rec
   //   [3*head_dim .. 4*head_dim)  : final_rotated = rec + qjl_correction
-  //   [4*head_dim ..)             : reduction scratch (max ntg/SIMD_SIZE
+  //   [4*head_dim ..)             : reduction scratch (max ntg/TQ_SIMD_SIZE
   //                                  + a small slack)
   threadgroup float *sh_y = shared_mem;
   threadgroup float *sh_rec = sh_y + head_dim;
