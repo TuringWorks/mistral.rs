@@ -8,6 +8,27 @@
 
 use candle_core::{CpuStorage, CustomOp1, DType, Result, Tensor};
 
+/// Both backends hand the kernel a *base pointer* for the rotation and
+/// projection matrices — neither reads the tensor's layout. A non-zero
+/// `start_offset` or a non-contiguous view would therefore be read as if it
+/// started at element 0, silently producing wrong numbers rather than an
+/// error.
+///
+/// Today's callers build these with `Tensor::from_vec` (offset 0, contiguous),
+/// so this always holds — but that is the *caller's* invariant, not one this
+/// module can enforce, and a lossy KV-cache codec is exactly where a silent
+/// wrong answer would be hardest to notice. Check it instead of assuming it.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn ensure_matrix_layout(layout: &candle_core::Layout, what: &str) -> Result<()> {
+    if layout.start_offset() != 0 || !layout.is_contiguous() {
+        candle_core::bail!(
+            "TurboQuantEncode: {what} must have start_offset 0 and be contiguous \
+             (the kernel receives a base pointer, not a strided view)"
+        );
+    }
+    Ok(())
+}
+
 /// Per-call wrapper that bakes the rotation/projection matrices into a
 /// `CustomOp1`. The matrices are passed by reference — the backend paths
 /// extract device pointers when they fire.
@@ -66,11 +87,13 @@ impl<'a> CustomOp1 for TurboQuantEncode<'a> {
         }
         let num_vectors = total / self.head_dim;
 
-        let (rot_storage, _) = self.rotation.storage_and_layout();
+        let (rot_storage, rot_layout) = self.rotation.storage_and_layout();
+        ensure_matrix_layout(rot_layout, "rotation")?;
         let Storage::Cuda(rot_cuda) = &*rot_storage else {
             candle_core::bail!("TurboQuantEncode: rotation must live on CUDA");
         };
-        let (proj_storage, _) = self.projection.storage_and_layout();
+        let (proj_storage, proj_layout) = self.projection.storage_and_layout();
+        ensure_matrix_layout(proj_layout, "projection")?;
         let Storage::Cuda(proj_cuda) = &*proj_storage else {
             candle_core::bail!("TurboQuantEncode: projection must live on CUDA");
         };
@@ -187,14 +210,16 @@ impl<'a> CustomOp1 for TurboQuantEncode<'a> {
         let encoder = device.command_encoder()?;
         encoder.set_label("turboquant-encode");
 
-        let (rot_storage, _) = self.rotation.storage_and_layout();
+        let (rot_storage, rot_layout) = self.rotation.storage_and_layout();
+        ensure_matrix_layout(rot_layout, "rotation")?;
         let Storage::Metal(rot_metal) = &*rot_storage else {
             candle_core::bail!("TurboQuantEncode: rotation must live on Metal");
         };
         if rot_metal.dtype() != DType::F32 {
             candle_core::bail!("TurboQuantEncode: rotation must be F32");
         }
-        let (proj_storage, _) = self.projection.storage_and_layout();
+        let (proj_storage, proj_layout) = self.projection.storage_and_layout();
+        ensure_matrix_layout(proj_layout, "projection")?;
         let Storage::Metal(proj_metal) = &*proj_storage else {
             candle_core::bail!("TurboQuantEncode: projection must live on Metal");
         };
