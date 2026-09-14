@@ -298,7 +298,10 @@ fn bring_up_loopback() -> io::Result<()> {
     ifr.ifr_name[2] = 0;
     ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
 
-    let rc = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) };
+    // `ioctl`'s request parameter type varies by libc (`c_int` on musl,
+    // `c_ulong` on glibc); `SIOCSIFFLAGS` is a small, fixed ioctl number that
+    // fits either way, so `as _` picks whichever the target expects.
+    let rc = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) };
     let err = if rc == 0 {
         None
     } else {
